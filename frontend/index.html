@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agentic Research Assistant</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="header">
+    <h1>Agentic Research Assistant</h1>
+    <p class="sub">Live agent logs · vector-grounded synthesis · mid-run feedback</p>
+  </header>
+
+  <main class="layout">
+    <section class="panel controls">
+      <label for="topic">Research topic</label>
+      <textarea id="topic" rows="3" placeholder="e.g. The future of silicon photonics"></textarea>
+      <div class="row">
+        <button type="button" id="startBtn">Start research</button>
+        <button type="button" id="stopBtn" class="secondary" disabled>Disconnect stream</button>
+      </div>
+      <label for="feedback">Correct the agent mid-run</label>
+      <textarea id="feedback" rows="2" placeholder="e.g. Focus on datacenter interconnects, ignore consumer optics"></textarea>
+      <button type="button" id="feedbackBtn" class="secondary" disabled>Send feedback</button>
+      <p class="hint">Feedback is applied before the next sub-topic. Requires <code>OPENAI_API_KEY</code> on the server.</p>
+    </section>
+
+    <section class="panel log-panel">
+      <div class="log-header">Agent log</div>
+      <pre id="log" class="log"></pre>
+    </section>
+
+    <section class="panel report-panel">
+      <div class="log-header">Final report</div>
+      <article id="report" class="report"></article>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/marked@11.1.1/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
