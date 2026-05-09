@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", str(Path(__file__).resolve().parent.parent / "chroma_data"))
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+FRONTEND_DIST = FRONTEND_DIR / "dist"
 
 chroma_client = get_client(CHROMA_DIR)
 
@@ -124,13 +125,17 @@ async def health():
     return {"status": "ok"}
 
 
-if FRONTEND_DIR.is_dir():
-    app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
+_assets_dir = FRONTEND_DIST / "assets"
+if _assets_dir.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(_assets_dir)), name="vite_assets")
 
 
 @app.get("/")
 async def root_index():
-    index = FRONTEND_DIR / "index.html"
+    index = FRONTEND_DIST / "index.html"
     if index.is_file():
         return FileResponse(index)
-    return {"message": "Frontend not found; open /docs for API."}
+    return {
+        "message": "Frontend build not found. From frontend/: npm install && npm run build — or npm run dev with Vite proxy.",
+        "docs": "/docs",
+    }
