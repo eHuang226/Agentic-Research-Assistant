@@ -1,4 +1,4 @@
-"""Plan → ReAct sub-research per subtopic (with feedback between steps) → RAG synthesis."""
+"""Plan → ReAct sub-research per subtopic → critic/verifier → RAG synthesis (with feedback between steps)."""
 
 from __future__ import annotations
 
@@ -27,6 +27,10 @@ def _model_name() -> str:
 
 def _llm() -> ChatOpenAI:
     return ChatOpenAI(model=_model_name(), temperature=0.2)
+
+
+def _critic_llm() -> ChatOpenAI:
+    return ChatOpenAI(model=_model_name(), temperature=0)
 
 
 class SSEBridgeHandler(BaseCallbackHandler):
@@ -115,6 +119,106 @@ def _build_subtopic_agent(tools, extra_context: str):
         handle_parsing_errors=True,
         return_intermediate_steps=False,
     )
+
+
+def _parse_verdict_json(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if "```" in raw:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            raw = raw[start : end + 1]
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            status = data.get("status", "warn")
+            if status not in ("pass", "warn", "fail"):
+                status = "warn"
+            issues = data.get("issues")
+            if not isinstance(issues, list):
+                issues = []
+            issues_stripped = [str(x).strip() for x in issues if str(x).strip()]
+            summary = str(data.get("summary") or "").strip()
+            if not summary:
+                summary = "; ".join(issues_stripped) if issues_stripped else "Verification incomplete."
+            return {"status": status, "issues": issues_stripped, "summary": summary}
+    except json.JSONDecodeError:
+        pass
+    preview = raw[:500] if raw else ""
+    return {
+        "status": "warn",
+        "issues": ["Could not parse verifier JSON."],
+        "summary": preview or "Verifier returned unparsable output.",
+    }
+
+
+async def verify_subtopic(
+    topic: str,
+    sub_q: str,
+    idx: int,
+    collection,
+    researcher_preview: str,
+    emit,
+) -> dict[str, Any]:
+    """LLM-only critic: judges retrieved chunks vs the subquestion (no web/tools)."""
+    await emit(
+        "critic_start",
+        {"index": idx, "subtopic_question": sub_q, "message": "Verifier reviewing stored evidence…"},
+    )
+    chunks = query_context(collection, sub_q, n_results=12)
+    if not chunks:
+        verdict: dict[str, Any] = {
+            "status": "fail",
+            "issues": ["No grounded chunks found in session store for this sub-question."],
+            "summary": "Nothing retrievable was stored for this subtopic; rerun research or broaden sources.",
+        }
+        await emit("critic_end", {"index": idx, "verdict": verdict})
+        return verdict
+
+    context_blocks: list[str] = []
+    for i, c in enumerate(chunks):
+        meta = c.get("metadata") or {}
+        url = meta.get("source_url", "")
+        title = meta.get("title", "")
+        context_blocks.append(f"[{i + 1}] ({title}) {url}\n{c.get('text', '')}")
+    context = "\n\n".join(context_blocks)
+    preview = (researcher_preview or "").strip()[:2500]
+
+    llm = _critic_llm()
+    prompt = f"""You are a strict research verifier. Judge whether the STORED CONTEXT is enough to address the SUBQUESTION
+for the overall TOPIC. Do not assume facts beyond the excerpts. Prefer diverse URLs when possible.
+
+Return ONLY a JSON object (no markdown) with exactly these keys:
+- "status": one of "pass", "warn", "fail"
+- "issues": array of short strings (empty if pass)
+- "summary": one sentence for the researcher
+
+Meaning of status:
+- "pass": excerpts substantively answer the subquestion with credible-looking sourcing.
+- "warn": partial, thin, or tangential coverage; researcher should strengthen.
+- "fail": irrelevant, missing, or unusable evidence for this subquestion.
+
+TOPIC: {topic}
+
+SUBQUESTION: {sub_q}
+
+RESEARCHER FINAL ANSWER PREVIEW (secondary; trust STORED CONTEXT for facts):
+{preview}
+
+STORED CONTEXT:
+{context}
+"""
+    msg = await llm.ainvoke([HumanMessage(content=prompt)])
+    verdict = _parse_verdict_json(msg.content or "")
+    await emit(
+        "critic_end",
+        {
+            "index": idx,
+            "verdict": verdict,
+            "chunks_reviewed": len(chunks),
+        },
+    )
+    return verdict
 
 
 async def synthesize_report(topic: str, collection, emit, user_notes: list[str]) -> str:
@@ -207,10 +311,25 @@ async def run_research_pipeline(
 
         try:
             out = await asyncio.to_thread(run_agent)
+            preview = str(out.get("output", ""))[:1200]
             await emit(
                 "subtopic_end",
-                {"index": idx, "preview": str(out.get("output", ""))[:1200]},
+                {"index": idx, "preview": preview},
             )
+            verdict = await verify_subtopic(
+                topic,
+                sub_q,
+                idx,
+                collection,
+                researcher_preview=str(out.get("output", "")),
+                emit=emit,
+            )
+            if verdict.get("status") in ("warn", "fail"):
+                note = verdict.get("summary") or ""
+                issues = verdict.get("issues") or []
+                if issues and verdict.get("status") == "fail":
+                    note = f"{note} Issues: {'; '.join(issues[:5])}"
+                user_feedback_accum.append(f"Verifier (subtopic {idx + 1}): {note}")
         except Exception as e:  # noqa: BLE001
             logger.exception("Subtopic agent failed")
             await emit("error", {"index": idx, "message": str(e)})
