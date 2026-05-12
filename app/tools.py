@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from typing import Callable
@@ -11,6 +12,8 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
+
+from app.vector_store import VectorStoreClient
 
 
 def _truncate(s: str, max_len: int = 12000) -> str:
@@ -56,15 +59,33 @@ class StoreInput(BaseModel):
 
 
 def make_tools(
-    collection,
+    session_id: str,
+    vs_client: VectorStoreClient,
+    loop: asyncio.AbstractEventLoop,
     on_store: Callable[[str, str, str], None] | None = None,
 ):
-    """Tools bound to a Chroma collection; on_store optional log hook."""
+    """Tools bound to a session via the MCP vector-store client.
+
+    store_research_chunk runs from a sync LangChain thread; it schedules the
+    async MCP call onto the main event loop with run_coroutine_threadsafe.
+    """
 
     def store_research_chunk(excerpt: str, source_url: str, title: str = "") -> str:
         eid = str(uuid.uuid4())
         meta = {"source_url": source_url, "title": title or source_url}
-        collection.add(documents=[excerpt], metadatas=[meta], ids=[eid])
+        future = asyncio.run_coroutine_threadsafe(
+            vs_client.add_documents(
+                session_id=session_id,
+                texts=[excerpt],
+                metadatas=[meta],
+                ids=[eid],
+            ),
+            loop,
+        )
+        try:
+            future.result(timeout=30)
+        except Exception as e:  # noqa: BLE001
+            return f"Failed to store chunk: {e}"
         if on_store:
             on_store(excerpt, source_url, title)
         return f"Stored chunk {eid} ({len(excerpt)} chars) from {source_url}"

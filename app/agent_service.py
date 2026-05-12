@@ -16,7 +16,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI
 
 from app.tools import make_tools
-from app.vector_store import query_context
+from app.vector_store import VectorStoreClient
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,6 @@ async def plan_subtopics(topic: str, emit) -> list[str]:
             return [x.strip() for x in data if x.strip()][:3]
     except json.JSONDecodeError:
         pass
-    # Fallback: split lines
     lines = [ln.strip("- •\t ") for ln in text.splitlines() if ln.strip()]
     return lines[:3] if lines else [topic]
 
@@ -156,7 +155,8 @@ async def verify_subtopic(
     topic: str,
     sub_q: str,
     idx: int,
-    collection,
+    session_id: str,
+    vs_client: VectorStoreClient,
     researcher_preview: str,
     emit,
 ) -> dict[str, Any]:
@@ -165,7 +165,7 @@ async def verify_subtopic(
         "critic_start",
         {"index": idx, "subtopic_question": sub_q, "message": "Verifier reviewing stored evidence…"},
     )
-    chunks = query_context(collection, sub_q, n_results=12)
+    chunks = await vs_client.query_context(session_id, sub_q, n_results=12)
     if not chunks:
         verdict: dict[str, Any] = {
             "status": "fail",
@@ -221,9 +221,15 @@ STORED CONTEXT:
     return verdict
 
 
-async def synthesize_report(topic: str, collection, emit, user_notes: list[str]) -> str:
+async def synthesize_report(
+    topic: str,
+    session_id: str,
+    vs_client: VectorStoreClient,
+    emit,
+    user_notes: list[str],
+) -> str:
     await emit("synthesis", {"message": "Retrieving grounded context from vector store…"})
-    chunks = query_context(collection, topic, n_results=12)
+    chunks = await vs_client.query_context(session_id, topic, n_results=12)
     if not chunks:
         return (
             "No stored research chunks were found. Run sub-research with successful store_research_chunk calls, "
@@ -258,7 +264,7 @@ CONTEXT:
 async def run_research_pipeline(
     topic: str,
     session_id: str,
-    collection,
+    vs_client: VectorStoreClient,
     events: asyncio.Queue,
     feedback_queue: asyncio.Queue,
 ) -> str:
@@ -266,6 +272,8 @@ async def run_research_pipeline(
 
     async def emit(kind: str, payload: dict | None = None):
         await _emit(events, kind, payload or {})
+
+    await vs_client.create_collection(session_id)
 
     await emit("session", {"session_id": session_id, "topic": topic})
     await emit("reasoning", {"message": "Planning sub-topics…"})
@@ -297,7 +305,7 @@ async def run_research_pipeline(
             except RuntimeError:
                 coro.close()
 
-        tools = make_tools(collection, on_store=on_store)
+        tools = make_tools(session_id, vs_client, loop, on_store=on_store)
         handler = SSEBridgeHandler(schedule_event)
         executor = _build_subtopic_agent(tools, extra_context=extra)
 
@@ -320,7 +328,8 @@ async def run_research_pipeline(
                 topic,
                 sub_q,
                 idx,
-                collection,
+                session_id,
+                vs_client,
                 researcher_preview=str(out.get("output", "")),
                 emit=emit,
             )
@@ -335,7 +344,7 @@ async def run_research_pipeline(
             await emit("error", {"index": idx, "message": str(e)})
 
     final_notes = user_feedback_accum + await _drain_feedback(feedback_queue)
-    report = await synthesize_report(topic, collection, emit, final_notes)
+    report = await synthesize_report(topic, session_id, vs_client, emit, final_notes)
     await emit("final", {"report": report})
     return report
 

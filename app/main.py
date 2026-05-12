@@ -17,23 +17,23 @@ from fastapi.staticfiles import StaticFiles
 
 from app.agent_service import new_session_id, run_research_pipeline
 from app.schemas import FeedbackRequest, ResearchRequest, ResearchResponse
-from app.vector_store import get_client, get_collection
+from app.vector_store import VectorStoreClient
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", str(Path(__file__).resolve().parent.parent / "chroma_data"))
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 FRONTEND_DIST = FRONTEND_DIR / "dist"
 
-chroma_client = get_client(CHROMA_DIR)
+vs_client = VectorStoreClient()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    await vs_client.connect()
     yield
-    # Persistent Chroma client needs no explicit close in most versions
+    await vs_client.close()
 
 
 app = FastAPI(title="Agentic Research Assistant", lifespan=lifespan)
@@ -57,7 +57,6 @@ async def start_research(body: ResearchRequest):
 
     events: asyncio.Queue = asyncio.Queue()
     feedback: asyncio.Queue = asyncio.Queue()
-    collection = get_collection(chroma_client, sid)
 
     sessions[sid] = {
         "events": events,
@@ -68,7 +67,8 @@ async def start_research(body: ResearchRequest):
 
     async def job():
         try:
-            await run_research_pipeline(body.topic, sid, collection, events, feedback)
+            report = await run_research_pipeline(body.topic, sid, vs_client, events, feedback)
+            sessions[sid]["report"] = report
         except Exception as e:  # noqa: BLE001
             logger.exception("Research pipeline failed for session %s", sid)
             await events.put({"kind": "error", "message": str(e)})
@@ -90,6 +90,16 @@ async def post_feedback(session_id: str, body: FeedbackRequest):
     await s["feedback"].put(body.message)
     await s["events"].put({"kind": "feedback_received", "message": body.message})
     return {"ok": True}
+
+
+@app.get("/api/sessions/{session_id}/report")
+async def get_report(session_id: str):
+    s = sessions.get(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Unknown session")
+    if "report" not in s:
+        raise HTTPException(status_code=202, detail="Report not ready yet")
+    return {"session_id": session_id, "report": s["report"]}
 
 
 @app.get("/api/sessions/{session_id}/events")
